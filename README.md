@@ -5,7 +5,10 @@ Saw a beautiful image and equation post on LinkedIn. Then I started thinking,
 what if I made my own version of that but for any arbitrary image. What if I 
 made it generate points and from the points of an equation I can generate 
 an arbitrary image?
-It hit me, this is an application problem of the fast interpolation algo from pico24.(https://github.com/Reuvi/UnderstandingFlagPrinter) With a little bit of help from AI to create the file-IO and CODEC(compressing and decompressing) functions, made this really cool CLI application!
+It hit me, this is an application problem of the fast interpolation algo 
+from pico24.(https://github.com/Reuvi/UnderstandingFlagPrinter) With a 
+little bit of help from AI to create the file-IO and CODEC(compressing 
+and decompressing) functions, made this really cool CLI application!
 
 
 
