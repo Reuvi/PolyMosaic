@@ -1,0 +1,73 @@
+
+\documentclass[11pt]{article}
+\usepackage{amsmath, amssymb}
+\usepackage[margin=1in]{geometry}
+
+\begin{document}
+\section*{Chunked Polynomial Equation}
+
+We work over the finite field $\mathbb{F}_p$ with
+\[
+p = \text{(not specified)}.
+\]
+
+Mode: RGB bytes. Image size: 350\textbackslash\{\}times628.
+
+
+\subsection*{Chunk sizes}
+\[
+\text{chunk\_size} = 1000,\quad \text{\#chunks} = 660,\quad \text{total bytes} = 659400
+\]
+\begin{center}
+\begin{tabular}{r r}
+\textbf{chunk} & \textbf{length }n_c \\
+\hline
+0 & 1000 \\
+1 & 1000 \\
+2 & 1000 \\
+3 & 1000 \\
+4 & 1000 \\
+5 & 1000 \\
+6 & 1000 \\
+7 & 1000 \\
+8 & 1000 \\
+9 & 1000 \\
+10 & 1000 \\
+11 & 1000 \\
+\vdots & \vdots \\
+657 & 1000 \\
+658 & 1000 \\
+659 & 400 \\
+\end{tabular}
+\end{center}
+
+
+\subsection*{Coefficient (equation.txt) view}
+The payload is split into chunks. For each chunk $c$, define a polynomial over $\mathbb{F}_p$:
+\[
+P_c(x) = \sum_{k=0}^{n_c-1} a_{c,k}\,x^k,
+\qquad a_{c,k} \in \mathbb{F}_p.
+\]
+In this codec, the coefficients $a_{c,k}$ are the chunk's bytes interpreted in $\mathbb{F}_p$.
+
+\subsubsection*{Tiny example: first 10 coefficients of chunk 0}
+\[
+(a_{0,0}, a_{0,1}, \dots, a_{0,9})
+=
+(71, 112, 76, 71, 112, 76, 71, 112, 76, 71)
+\]
+
+\subsection*{Barycentric / subproduct-tree (points) view}
+For a chunk $c$ with nodes $x_i=i$ for $i=1,\dots,n_c$, define:
+\[
+Z_c(x) = \prod_{j=1}^{n_c} (x - x_j),
+\qquad
+w_i^659 = \frac{y_i^659}{Z'_c(x_i)}.
+\]
+Then the interpolating polynomial can be written (without expansion) as:
+\[
+P_c(x) = \sum_{i=1}^{n_c} w_i^659 \cdot \frac{Z_c(x)}{x-x_i}
+\quad \text{in } \mathbb{F}_p.
+\]
+
+\end{document}

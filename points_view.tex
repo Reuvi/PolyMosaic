@@ -1,0 +1,38 @@
+
+\documentclass[11pt]{article}
+\usepackage{amsmath, amssymb}
+\usepackage[margin=1in]{geometry}
+
+\begin{document}
+\section*{Chunked Points (Barycentric) Equation}
+
+We work over $\mathbb{F}_p$ with
+\[
+p = 7514777789.
+\]
+\[
+\text{chunk\_size} = 1000,\quad \text{\#chunks} = 660,\quad \text{total bytes} = 659400.
+\]
+
+\subsection*{Per-chunk barycentric form}
+For chunk $c$ with length $n_c$, nodes are
+\[
+x_i=i,\quad i=1,\dots,n_c.
+\]
+Let the stored values be $y_i^{(c)} \in \mathbb{F}_p$. Define:
+\[
+Z_c(x) = \prod_{j=1}^{n_c} (x - x_j),\qquad
+w_i^{(c)} = \frac{y_i^{(c)}}{Z'_c(x_i)}.
+\]
+Then:
+\[
+P_c(x) = \sum_{i=1}^{n_c} w_i^{(c)} \cdot \frac{Z_c(x)}{x-x_i}.
+\]
+
+\subsubsection*{Tiny example: first 12 y-values of chunk 0}
+\[
+(y_1^{(0)}, y_2^{(0)}, \dots) =
+(86318, 1863247245, 4734882902, 4295873881, 1349779452, 4324410756, 934631908, 6814942576, 205104905, 1858521733, 2149332046, 1622191145)
+\]
+
+\end{document}
