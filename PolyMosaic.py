@@ -441,6 +441,30 @@ def fastEval(f, tree: Tree):
         B = fastEval(r2, tree.right)
     return A + B
 
+def fastEval(f, tree: Tree):
+    # Leaf node: tree.poly is (x - xi)
+    if len(tree) == 1:
+        xi = -tree.poly(0)
+        return [f(xi)]
+
+    # Constant polynomial: same value for every x in this subtree
+    if f.degree() == 0:
+        return [f] * len(tree)
+
+    A = []
+    B = []
+
+    if tree.left:
+        _, r1 = f.quo_rem(tree.left.poly)
+        A = fastEval(r1, tree.left)
+
+    if tree.right:
+        _, r2 = f.quo_rem(tree.right.poly)
+        B = fastEval(r2, tree.right)
+
+    return A + B
+
+
 def fast_interpolate(weights, tree: Tree):
     if len(tree) == 1:
         return weights[0]
@@ -701,6 +725,509 @@ def points_to_image(points_path: str, out_path: str, *, workers: int):
     except OSError:
         pass
 
+#2d Cool stuff
+
+RGB24_MOD = 1 << 24  # 16777216
+
+def rgb_to_u24(r: int, g: int, b: int) -> int:
+    return (r & 255) | ((g & 255) << 8) | ((b & 255) << 16)
+
+def u24_to_rgb(v: int) -> Tuple[int, int, int]:
+    v &= (RGB24_MOD - 1)
+    return (v & 255), ((v >> 8) & 255), ((v >> 16) & 255)
+
+def field_to_u24(v: int, *, continuation: str, p: int) -> int:
+    """
+    Map field element (0..p-1) -> [0..2^24-1] for RGB packing.
+    continuation:
+      - "mod24": wrap mod 2^24
+      - "scale24": linear scale [0..p-1] -> [0..2^24-1]
+      - "clamp24": clamp into [0..2^24-1]
+      - "smooth24": smootherstep scale [0..p-1] -> [0..2^24-1] (C^2 smooth)
+    NOTE: We preserve exact RGB if v already fits in 24 bits.
+    """
+    vi = int(v)
+
+    # Preserve exact original pixels whenever possible
+    if 0 <= vi < RGB24_MOD:
+        return vi
+
+    # Normalize into field range just in case
+    vi %= p
+
+    if continuation == "scale24":
+        return (vi * (RGB24_MOD - 1)) // (p - 1)
+
+    if continuation == "smooth24":
+        # smootherstep(t) = 6t^5 - 15t^4 + 10t^3, t in [0,1]
+        # Do it with integer math: t = vi/(p-1)
+        N = p - 1
+        x = vi
+
+        # num/den = smootherstep(x/N) with den = N^5
+        x2 = x * x
+        x3 = x2 * x
+        x4 = x3 * x
+        x5 = x4 * x
+
+        N2 = N * N
+        N4 = N2 * N2
+        N5 = N4 * N
+
+        num = 6 * x5 - 15 * x4 * N + 10 * x3 * N2
+        den = N5
+
+        # map to [0..2^24-1] with rounding
+        return (num * (RGB24_MOD - 1) + den // 2) // den
+
+    if continuation == "clamp24":
+        if vi < 0:
+            return 0
+        return RGB24_MOD - 1
+
+    # default: mod24
+    return vi % RGB24_MOD
+
+
+def row_rgb_bytes_to_u24_list(row_rgb: bytes) -> List[int]:
+    out = []
+    for i in range(0, len(row_rgb), 3):
+        out.append(rgb_to_u24(row_rgb[i], row_rgb[i+1], row_rgb[i+2]))
+    return out
+
+def _get_tree_and_denom_affine(n: int, stride: int, x0: int):
+    cache = _worker_state["cache"]
+    key = ("affine", n, stride, x0)
+    if key in cache:
+        return cache[key]
+
+    R = _worker_state["R"]
+    X = [x0 + stride*i for i in range(n)]
+    tree = compTree(X, R)
+    Zp = tree.poly.derivative()
+    denom = fastEval(Zp, tree)
+    cache[key] = (tree, denom)
+    return tree, denom
+
+def _get_tree_affine_only(n: int, stride: int, x0: int):
+    cache = _worker_state["cache"]
+    key = ("tree_affine", n, stride, x0)
+    if key in cache:
+        return cache[key]
+    R = _worker_state["R"]
+    X = [x0 + stride*i for i in range(n)]
+    tree = compTree(X, R)
+    cache[key] = tree
+    return tree
+
+def write_equation2_txt(path: str, obj: Dict[str, Any]) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2)
+
+def read_equation2_txt(path: str) -> Dict[str, Any]:
+    return json.loads(open(path, "r", encoding="utf-8").read())
+
+def _row_interpolate_worker_eq2(args):
+    row_idx, y_u24_list, cols, stride_x, x0 = args
+    K = _worker_state["K"]
+    tree, denom = _get_tree_and_denom_affine(cols, stride_x, x0)
+
+    Y = [K(v) for v in y_u24_list]
+    weights = [y / d for (y, d) in zip(Y, denom)]
+    poly = fast_interpolate(weights, tree)
+
+    coeffs = [int(c) for c in poly.coefficients(sparse=False)]
+    if len(coeffs) < cols:
+        coeffs += [0] * (cols - len(coeffs))
+    coeffs = coeffs[:cols]
+
+    blob = zcompress(pack_u64_le(coeffs), 9)
+    return row_idx, b64e(blob)
+
+def _row_eval_worker_eq2(args):
+    row_idx, coeff_b64, cols, stride_x, x0, out_cols = args
+    R = _worker_state["R"]
+
+    coeffs = unpack_u64_le(zdecompress(b64d(coeff_b64)))
+    f = R(coeffs[:cols])
+
+    if out_cols == cols:
+        tree_eval = _get_tree_affine_only(cols, stride_x, x0)
+    else:
+        # fill_x => evaluate at every integer from x0..x0+stride_x*(cols-1)
+        tree_eval = _get_tree_affine_only(out_cols, 1, x0)
+
+    Y = fastEval(f, tree_eval)
+    return row_idx, [int(v) for v in Y]  # field ints
+
+def _col_interp_eval_eq2(col_vals: List[int], rows: int, stride_y: int, y0: int, out_rows: int) -> List[int]:
+    K = _worker_state["K"]
+    tree_nodes, denom = _get_tree_and_denom_affine(rows, stride_y, y0)
+
+    Y = [K(v) for v in col_vals]
+    weights = [y / d for (y, d) in zip(Y, denom)]
+    poly = fast_interpolate(weights, tree_nodes)
+
+    if out_rows == rows:
+        tree_eval = _get_tree_affine_only(rows, stride_y, y0)
+    else:
+        tree_eval = _get_tree_affine_only(out_rows, 1, y0)
+
+    outY = fastEval(poly, tree_eval)
+    return [int(v) for v in outY]
+
+def image_to_equation2(image_path: str, equation2_path: str, p: int, *, stride_x: int = 1, x0: int = 1,
+                      stride_y: int = 1, y0: int = 1, workers: int = 1):
+    from PIL import Image
+    im = Image.open(image_path).convert("RGB")
+    cols, rows = im.size
+    raw = im.tobytes()
+
+    if p <= RGB24_MOD:
+        raise ValueError("p must be > 2^24 for rgb24 packing.")
+
+    row_bytes = [raw[r*cols*3:(r+1)*cols*3] for r in range(rows)]
+    row_u24 = [row_rgb_bytes_to_u24_list(rb) for rb in row_bytes]
+
+    obj = {
+        "scheme": "equation2-rowwise-rgb24-v1",
+        "p": int(p),
+        "rows": rows,
+        "cols": cols,
+        "stride_x": int(stride_x),
+        "x0": int(x0),
+        "stride_y": int(stride_y),
+        "y0": int(y0),
+        "coeff_format": "u64le-zlib-b64-per-row",
+        "sha256_rgb": sha256_hex(raw),
+        "rows_coeff_b64": [None] * rows,
+    }
+
+    tasks = [(r, row_u24[r], cols, stride_x, x0) for r in range(rows)]
+
+    if workers <= 1:
+        _init_worker(p)
+        for t in tasks:
+            r, b64coeff = _row_interpolate_worker_eq2(t)
+            obj["rows_coeff_b64"][r] = b64coeff
+    else:
+        ctx = mp.get_context("spawn" if os.name == "nt" else "fork")
+        with ctx.Pool(processes=workers, initializer=_init_worker, initargs=(p,)) as pool:
+            for (r, b64coeff) in pool.imap_unordered(_row_interpolate_worker_eq2, tasks, chunksize=1):
+                obj["rows_coeff_b64"][r] = b64coeff
+
+    write_equation2_txt(equation2_path, obj)
+
+def equation2_to_image(equation2_path: str, out_path: str, *, fill_x: bool = False, fill_y: bool = False,
+                       continuation: str = "mod24", workers: int = 1):
+    from PIL import Image
+
+    obj = read_equation2_txt(equation2_path)
+    if obj.get("scheme") != "equation2-rowwise-rgb24-v1":
+        raise ValueError("Unsupported equation2 scheme.")
+
+    p = int(obj["p"])
+    rows = int(obj["rows"])
+    cols = int(obj["cols"])
+    stride_x = int(obj["stride_x"])
+    x0 = int(obj["x0"])
+    stride_y = int(obj.get("stride_y", 1))
+    y0 = int(obj.get("y0", 1))
+    row_coeffs = obj["rows_coeff_b64"]
+
+    out_cols = (stride_x * (cols - 1) + 1) if fill_x else cols
+    out_rows = (stride_y * (rows - 1) + 1) if fill_y else rows
+
+    # ---- Step 1: Horizontal evaluation (row polynomials) -> row_vals[r][c] in field ints
+    tasks = [(r, row_coeffs[r], cols, stride_x, x0, out_cols) for r in range(rows)]
+
+    row_vals: List[List[int]] = [None] * rows  # each is list length out_cols
+    if workers <= 1:
+        _init_worker(p)
+        for t in tasks:
+            r, vals = _row_eval_worker_eq2(t)
+            row_vals[r] = vals
+    else:
+        ctx = mp.get_context("spawn" if os.name == "nt" else "fork")
+        with ctx.Pool(processes=workers, initializer=_init_worker, initargs=(p,)) as pool:
+            results = list(pool.imap_unordered(_row_eval_worker_eq2, tasks, chunksize=1))
+        results.sort(key=lambda x: x[0])
+        for r, vals in results:
+            row_vals[r] = vals
+
+    # ---- Step 2: If no vertical fill, write directly
+    if not fill_y:
+        out_rgb = bytearray(out_rows * out_cols * 3)
+        for r in range(rows):
+            base = r * out_cols * 3
+            rv = row_vals[r]
+            for c in range(out_cols):
+                u = field_to_u24(rv[c], continuation=continuation, p=p)
+                rr, gg, bb = u24_to_rgb(u)
+                k = base + 3*c
+                out_rgb[k] = rr
+                out_rgb[k+1] = gg
+                out_rgb[k+2] = bb
+        Image.frombytes("RGB", (out_cols, rows), bytes(out_rgb)).save(out_path, format="PNG")
+        return
+
+    # ---- Step 3: Vertical fill (per column interpolation)
+    _init_worker(p)  # vertical pass in-process (keeps it simple + safe)
+
+    out_rgb = bytearray(out_rows * out_cols * 3)
+
+    for c in range(out_cols):
+        col = [row_vals[r][c] for r in range(rows)]
+        col_out = _col_interp_eval_eq2(col, rows, stride_y, y0, out_rows)
+
+        for r_out in range(out_rows):
+            u = field_to_u24(col_out[r_out], continuation=continuation, p=p)
+            rr, gg, bb = u24_to_rgb(u)
+            k = (r_out * out_cols + c) * 3
+            out_rgb[k] = rr
+            out_rgb[k+1] = gg
+            out_rgb[k+2] = bb
+
+    Image.frombytes("RGB", (out_cols, out_rows), bytes(out_rgb)).save(out_path, format="PNG")
+
+# ----------------------------
+# Equation3: Local per-channel continuation (piecewise Lagrange)
+# ----------------------------
+
+def write_equation3_txt(path: str, payload_rgb: bytes, meta: Dict[str, Any], compress: bool = True):
+    h = sha256_hex(payload_rgb)
+    blob = zcompress(payload_rgb, 9) if compress else payload_rgb
+    obj = {
+        "scheme": "equation3-local-lagrange-rgb-v1",
+        "meta": meta,
+        "compressed": "zlib" if compress else None,
+        "sha256": h,
+        "n_bytes": len(payload_rgb),
+        "data_b64": b64e(blob),
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2)
+
+def read_equation3_txt(path: str) -> Tuple[bytes, Dict[str, Any]]:
+    obj = json.loads(open(path, "r", encoding="utf-8").read())
+    if obj.get("scheme") != "equation3-local-lagrange-rgb-v1":
+        raise ValueError("Unknown equation3 scheme.")
+    blob = b64d(obj["data_b64"])
+    raw = zdecompress(blob) if obj.get("compressed") == "zlib" else blob
+    if sha256_hex(raw) != obj.get("sha256"):
+        raise ValueError("SHA256 mismatch (corrupt equation3 file).")
+    return raw[: obj["n_bytes"]], obj["meta"]
+
+
+def _lagrange_coeffs(xs: List[int], x: float) -> List[float]:
+    # xs are distinct integers (window), x is float
+    k = len(xs)
+    coeffs = []
+    for j in range(k):
+        xj = xs[j]
+        num = 1.0
+        den = 1.0
+        for m in range(k):
+            if m == j:
+                continue
+            xm = xs[m]
+            num *= (x - xm)
+            den *= (xj - xm)
+        coeffs.append(num / den)
+    return coeffs
+
+def _plan_1d(n: int, stride: int, k: int) -> Tuple[List[Any], int]:
+    """
+    Plan for output positions along one axis.
+
+    Anchors live at positions 0..n-1 in "anchor coordinate".
+    Output positions are x_out in [0..stride*(n-1)] and map to anchor coordinate u = x_out/stride.
+    """
+    if n <= 1:
+        return [("exact", 0)], 1
+
+    k = max(2, min(k, n))
+    out_n = stride * (n - 1) + 1
+    plans: List[Any] = [None] * out_n
+
+    max_start = n - k
+
+    for x_out in range(out_n):
+        if stride == 1 or (x_out % stride == 0):
+            a = x_out // stride
+            plans[x_out] = ("exact", a)
+            continue
+
+        u = x_out / float(stride)  # anchor-coordinate position
+        base = int(u)  # floor
+
+        # For cubic k=4, this is base-1; generalized for even-ish k
+        start = base - (k // 2 - 1)
+        if start < 0:
+            start = 0
+        if start > max_start:
+            start = max_start
+
+        xs = [start + j for j in range(k)]
+        coeffs = _lagrange_coeffs(xs, u)
+        plans[x_out] = ("interp", xs, coeffs)
+
+    return plans, out_n
+
+def _clamp_byte(v: float) -> int:
+    iv = int(round(v))
+    if iv < 0: return 0
+    if iv > 255: return 255
+    return iv
+
+
+def image_to_equation3(image_path: str, equation3_path: str, *, stride_x: int, stride_y: int, k: int):
+    """
+    Stores the *original* image RGB bytes + metadata describing the local continuation grid.
+    """
+    from PIL import Image
+    im = Image.open(image_path).convert("RGB")
+    cols, rows = im.size
+    rgb = im.tobytes()
+
+    meta = {
+        "mode": "rgb-bytes",
+        "rows": rows,
+        "cols": cols,
+        "stride_x": int(stride_x),
+        "stride_y": int(stride_y),
+        "k": int(k),
+    }
+    write_equation3_txt(equation3_path, rgb, meta, compress=True)
+
+
+def equation3_to_image(
+    equation3_path: str,
+    out_path: str,
+    *,
+    fill_x: bool,
+    fill_y: bool,
+    k: int,
+    workers: int = 1,  # kept for symmetry; numpy path is fast anyway
+):
+    """
+    Reconstructs exact original if fill_x/fill_y are False.
+    If fill_x and/or fill_y are True, inserts pixels using local per-channel Lagrange (default cubic, k=4).
+    """
+    from PIL import Image
+
+    rgb, meta = read_equation3_txt(equation3_path)
+    rows = int(meta["rows"])
+    cols = int(meta["cols"])
+    stride_x = int(meta.get("stride_x", 1))
+    stride_y = int(meta.get("stride_y", 1))
+    k = int(k if k is not None else meta.get("k", 4))
+
+    # Exact reconstruction
+    if not fill_x and not fill_y:
+        Image.frombytes("RGB", (cols, rows), rgb).save(out_path, format="PNG")
+        return
+
+    # Output dimensions
+    out_cols = (stride_x * (cols - 1) + 1) if fill_x else cols
+    out_rows = (stride_y * (rows - 1) + 1) if fill_y else rows
+
+    # Plans
+    plan_x, plan_x_len = _plan_1d(cols, stride_x if fill_x else 1, k)
+    plan_y, plan_y_len = _plan_1d(rows, stride_y if fill_y else 1, k)
+
+    # --- Horizontal pass: build horizontally-continued rows for the ORIGINAL anchor rows only
+    # H_rows[r] is bytes length out_cols*3
+    H_rows: List[bytes] = [None] * rows
+
+    for r in range(rows):
+        row = rgb[r * cols * 3 : (r + 1) * cols * 3]
+
+        # Extract channels for this row
+        Rv = [row[3*c]     for c in range(cols)]
+        Gv = [row[3*c + 1] for c in range(cols)]
+        Bv = [row[3*c + 2] for c in range(cols)]
+
+        out = bytearray(out_cols * 3)
+
+        for x_out in range(out_cols):
+            p = plan_x[x_out]
+            if p[0] == "exact":
+                a = p[1]
+                out[3*x_out]     = Rv[a]
+                out[3*x_out + 1] = Gv[a]
+                out[3*x_out + 2] = Bv[a]
+            else:
+                _, xs, coeffs = p
+                rr = 0.0; gg = 0.0; bb = 0.0
+                for j, idx in enumerate(xs):
+                    w = coeffs[j]
+                    rr += w * Rv[idx]
+                    gg += w * Gv[idx]
+                    bb += w * Bv[idx]
+                out[3*x_out]     = _clamp_byte(rr)
+                out[3*x_out + 1] = _clamp_byte(gg)
+                out[3*x_out + 2] = _clamp_byte(bb)
+
+        H_rows[r] = bytes(out)
+
+    # If no vertical fill, just stack H_rows
+    if not fill_y:
+        out_rgb = b"".join(H_rows)
+        Image.frombytes("RGB", (out_cols, rows), out_rgb).save(out_path, format="PNG")
+        return
+
+    # --- Vertical pass: interpolate between anchor rows (on already horizontally-filled data)
+    # Prefer numpy if available (fast + clean). Fallback is pure python (slower).
+    try:
+        import numpy as np
+        H = np.frombuffer(b"".join(H_rows), dtype=np.uint8).reshape(rows, out_cols, 3)
+
+        out_img = np.empty((out_rows, out_cols, 3), dtype=np.uint8)
+
+        for y_out in range(out_rows):
+            p = plan_y[y_out]
+            if p[0] == "exact":
+                a = p[1]
+                out_img[y_out] = H[a]
+            else:
+                _, ys, coeffs = p
+                # weighted sum of whole rows (vectorized)
+                acc = np.zeros((out_cols, 3), dtype=np.float64)
+                for j, ridx in enumerate(ys):
+                    acc += coeffs[j] * H[ridx].astype(np.float64)
+                out_img[y_out] = np.clip(np.rint(acc), 0, 255).astype(np.uint8)
+
+        Image.fromarray(out_img, mode="RGB").save(out_path, format="PNG")
+        return
+
+    except Exception:
+        # Fallback: pure python
+        out_rgb = bytearray(out_rows * out_cols * 3)
+
+        # Pre-split anchor rows into bytearrays for faster indexing
+        Hbytes = [memoryview(hr) for hr in H_rows]
+
+        for y_out in range(out_rows):
+            p = plan_y[y_out]
+            row_out = memoryview(out_rgb)[y_out * out_cols * 3 : (y_out + 1) * out_cols * 3]
+
+            if p[0] == "exact":
+                a = p[1]
+                row_out[:] = Hbytes[a]
+            else:
+                _, ys, coeffs = p
+                a0, a1, a2, a3 = ys[0], ys[1], ys[2], ys[3]
+                c0, c1, c2, c3 = coeffs[0], coeffs[1], coeffs[2], coeffs[3]
+
+                r0 = Hbytes[a0]; r1 = Hbytes[a1]; r2 = Hbytes[a2]; r3 = Hbytes[a3]
+                for i in range(out_cols * 3):
+                    v = c0 * r0[i] + c1 * r1[i] + c2 * r2[i] + c3 * r3[i]
+                    row_out[i] = _clamp_byte(v)
+
+        Image.frombytes("RGB", (out_cols, out_rows), bytes(out_rgb)).save(out_path, format="PNG")
+        return
+
 
 # ----------------------------
 # CLI
@@ -756,6 +1283,35 @@ def main():
     s8.add_argument("--local_x", action="store_true")
     s8.add_argument("--title", default=None)
 
+    s9 = sub.add_parser("image_to_equation2")
+    s9.add_argument("image")
+    s9.add_argument("equation2")
+    s9.add_argument("--stride_x", type=int, default=1)
+    s9.add_argument("--x0", type=int, default=1)
+    s9.add_argument("--stride_y", type=int, default=1)
+    s9.add_argument("--y0", type=int, default=1)
+
+    s10 = sub.add_parser("equation2_to_image")
+    s10.add_argument("equation2")
+    s10.add_argument("out")
+    s10.add_argument("--fill_x", action="store_true")
+    s10.add_argument("--fill_y", action="store_true")
+    s10.add_argument("--continuation", choices=["mod24", "scale24", "clamp24", "smooth24"], default="mod24")
+
+    s11 = sub.add_parser("image_to_equation3")
+    s11.add_argument("image")
+    s11.add_argument("equation3")
+    s11.add_argument("--stride_x", type=int, default=2)
+    s11.add_argument("--stride_y", type=int, default=2)
+    s11.add_argument("--k", type=int, default=4)
+
+    s12 = sub.add_parser("equation3_to_image")
+    s12.add_argument("equation3")
+    s12.add_argument("out")
+    s12.add_argument("--fill_x", action="store_true")
+    s12.add_argument("--fill_y", action="store_true")
+    s12.add_argument("--k", type=int, default=4)
+
 
     args = ap.parse_args()
     workers = args.workers
@@ -801,6 +1357,47 @@ def main():
             global_x=not args.local_x,
             as_scatter=args.scatter,
             title=args.title,
+        )
+
+    elif args.cmd == "image_to_equation2":
+        image_to_equation2(
+            args.image,
+            args.equation2,
+            args.p,
+            stride_x=args.stride_x,
+            x0=args.x0,
+            stride_y=args.stride_y,
+            y0=args.y0,
+            workers=workers,
+        )
+
+    elif args.cmd == "equation2_to_image":
+        equation2_to_image(
+            args.equation2,
+            args.out,
+            fill_x=args.fill_x,
+            fill_y=args.fill_y,
+            continuation=args.continuation,
+            workers=workers,
+        )
+
+    elif args.cmd == "image_to_equation3":
+        image_to_equation3(
+            args.image,
+            args.equation3,
+            stride_x=args.stride_x,
+            stride_y=args.stride_y,
+            k=args.k,
+        )
+
+    elif args.cmd == "equation3_to_image":
+        equation3_to_image(
+            args.equation3,
+            args.out,
+            fill_x=args.fill_x,
+            fill_y=args.fill_y,
+            k=args.k,
+            workers=workers,
         )
 
 
